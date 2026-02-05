@@ -1,66 +1,68 @@
 import xmlrpc.client
+import ssl
 
 class OdooConnector:
     def __init__(self, url, db, user, api_key):
-        self.url = url
+        # Ensure URL doesn't have a trailing slash
+        self.url = url.rstrip('/')
         self.db = db
         self.user = user
         self.password = api_key
         self.uid = None
-        self.models = None
+
+    def _get_proxy(self, service_path):
+        """Creates a secure proxy that handles Ngrok's HTTPS certificate."""
+        # Using unverified context is standard for dev-tunnels like Ngrok 
+        # to avoid 'Certificate Verify Failed' errors in cloud environments.
+        context = ssl._create_unverified_context()
+        return xmlrpc.client.ServerProxy(
+            f"{self.url}/xmlrpc/2/{service_path}", 
+            context=context, 
+            allow_none=True
+        )
 
     def _authenticate(self):
-        """Returns True if successful, or the error message if it fails."""
+        """Validates credentials via the public tunnel."""
         try:
-            common = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/common', allow_none=True)
-            # Check if we can even reach the server
+            common = self._get_proxy('common')
+            # The authenticate call returns the UID (int) if successful
             self.uid = common.authenticate(self.db, self.user, self.password, {})
             
             if not self.uid:
-                return "Authentication Failed: Invalid credentials or API Key."
-            
-            self.models = xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object', allow_none=True)
+                return "Auth Failed: Invalid DB name, Email, or API Key."
             return True
         except Exception as e:
-            return f"Connection Error: Could not reach Odoo at {self.url}. Details: {str(e)}"
+            return f"Tunnel Connection Failed: Ensure Ngrok is 'Online'. Details: {str(e)}"
 
     def extract_pos_data(self):
-        """
-        Returns a dictionary with status and data.
-        Possible statuses: 'success', 'auth_error', 'no_data', 'api_error'
-        """
+        """Fetches 'Paid' orders from the Odoo backend."""
         auth_status = self._authenticate()
-        
-        # 1. Handle Connection/Auth failures
         if auth_status is not True:
-            return {"status": "auth_error", "message": auth_status, "data": []}
+            return {"status": "error", "message": auth_status, "data": []}
 
         try:
-            # 2. Search for paid orders
-            order_ids = self.models.execute_kw(
+            models = self._get_proxy('object')
+            
+            # Fetch IDs for all finalized orders
+            order_ids = models.execute_kw(
                 self.db, self.uid, self.password,
                 'pos.order', 'search',
                 [[['state', 'in', ['paid', 'done', 'invoiced']]]]
             )
 
-            # 3. Handle specific case: Connection works, but no orders exist
             if not order_ids:
-                return {
-                    "status": "no_data", 
-                    "message": "Connection successful, but no orders were found in 'paid' or 'done' state.",
-                    "data": []
-                }
+                return {"status": "no_data", "message": "Connection OK, but no paid orders found.", "data": []}
 
-            # 4. Success: Retrieve the data
-            fields = ['name', 'date_order', 'amount_total', 'amount_tax', 'pos_reference']
-            pos_data = self.models.execute_kw(
+            # Retrieving specific fields for the 'System Components' part of your diagram
+            fields = ['name', 'date_order', 'amount_total', 'pos_reference']
+            pos_data = models.execute_kw(
                 self.db, self.uid, self.password,
                 'pos.order', 'read',
                 [order_ids],
                 {'fields': fields}
             )
             
-            return {"status": "success", "message": "Data retrieved successfully.", "data": pos_data}
+            return {"status": "success", "data": pos_data}
 
         except Exception as e:
-            return {"status": "api_error", "message": f"Odoo API Error: {str(e)}", "data": []}
+            return {"status": "api_error", "message": f"Odoo API Logic Error: {str(e)}", "data": []}
